@@ -5,6 +5,7 @@ from pyairtable import Api
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from langchain_openai import OpenAIEmbeddings
+import asyncio
 
 load_dotenv(override=True)
 
@@ -15,7 +16,11 @@ COLLECTION_NAME = "khepri_products"
 MODEL_NAME = "text-embedding-3-small"
 
 embeddings = OpenAIEmbeddings(model=MODEL_NAME)
-qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL", "http://localhost:6333"))
+qdrant_client = QdrantClient(
+    url=os.environ.get("QDRANT_URL"),
+    api_key=os.environ.get("QDRANT_API_KEY"),
+    cloud_inference=True
+)
 
 airtable = Api(AIRTABLE_API_KEY)
 stocks_table = airtable.table(AIRTABLE_BASE_ID, "Stocks")
@@ -30,7 +35,7 @@ class Product(BaseModel):
 
 
 @tool
-def fetch_inventory(query:str="") -> list[Product]:
+async def fetch_inventory(query:str="") -> list[Product]:
     """
     Search the product catalog.
 
@@ -76,13 +81,13 @@ def fetch_inventory(query:str="") -> list[Product]:
             if not airtable_record_id:
                 continue
 
-            record = stocks_table.get(airtable_record_id)
+            record = await asyncio.to_thread(stocks_table.get, airtable_record_id)
             if not record:
                 continue
             records.append(record)
 
     else:
-        records = stocks_table.all(max_records=10)
+        records = await asyncio.to_thread(stocks_table.all, max_records=10)
     
     for record in records:
         fields = record['fields']
@@ -98,7 +103,7 @@ def fetch_inventory(query:str="") -> list[Product]:
     return matched_products
 
 @tool
-def record_order(customer_name: str, customer_phone: str, product_id: str, quantity: int) -> str:
+async def record_order(customer_name: str, customer_phone: str, product_id: str, quantity: int) -> str:
     """
         Create a customer order.
 
@@ -133,7 +138,7 @@ def record_order(customer_name: str, customer_phone: str, product_id: str, quant
         "status": "pending",
     }
 
-    product = stocks_table.first(formula=f"{{product_id}}='{product_id}'")
+    product = await asyncio.to_thread(stocks_table.first, formula=f"{{product_id}}='{product_id}'")
     if not product:
         return f"Product with ID {product_id} not found in inventory."
 
@@ -144,8 +149,8 @@ def record_order(customer_name: str, customer_phone: str, product_id: str, quant
             return f"Insufficient stock for product {product_id}. Available: {available_quantity}, Requested: {quantity}."
 
         new_quantity = available_quantity - quantity
-        stocks_table.update(product['id'], {"stock_quantity": new_quantity})
+        await asyncio.to_thread(stocks_table.update, product['id'], {"stock_quantity": new_quantity})
 
-    record = orders_table.create(new_order)
+    record = await asyncio.to_thread(orders_table.create, new_order)
     record_id = record["fields"]["order_id"]
     return f"Order {record_id} recorded successfully for {customer_name} (Status: pending)."
