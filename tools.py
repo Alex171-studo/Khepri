@@ -6,8 +6,13 @@ from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from langchain_openai import OpenAIEmbeddings
 import asyncio
+from schemas.checkout import CheckoutRequest, CheckoutResponse, CheckoutErrorResponse, CheckoutErrorCode, purchase_item
+import httpx
+from typing import Union
 
 load_dotenv(override=True)
+
+N8N_CHECKOUT_WEBHOOK_URL = os.getenv("N8N_CHECKOUT_WEBHOOK_URL")
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
@@ -24,7 +29,6 @@ qdrant_client = QdrantClient(
 
 airtable = Api(AIRTABLE_API_KEY)
 stocks_table = airtable.table(AIRTABLE_BASE_ID, "Stocks")
-orders_table = airtable.table(AIRTABLE_BASE_ID, "Orders")
 
 class Product(BaseModel):
     name: str = Field(description="Name of the product")
@@ -32,6 +36,59 @@ class Product(BaseModel):
     stock_quantity: int = Field(description="Available quantity of the product in stock")
     price: float = Field(description="Price of the product")
     description: str = Field(description="Description of the product")
+
+@tool
+async def create_checkout_session(
+    customer_name: str,
+    customer_phone: str,
+    delivery_address: str,
+    items: list[purchase_item]
+    
+) -> Union[CheckoutResponse, CheckoutErrorResponse]:
+    """
+    Create a checkout session for the customer.
+
+    This tool is called after the customer has confirmed their order and provided their details.
+
+    Arguments:
+    - customer_name: The full name of the customer.
+    - customer_phone: The phone number of the customer.
+    - delivery_address: The delivery address for the order.
+    - items: A list of items being purchased, each containing the product_id and quantity (eg. [{"product_id": "prod_123", "quantity": 2}, {"product_id": "prod_456", "quantity": 1}]).
+
+    Returns:
+    - CheckoutResponse: If the checkout session is created successfully.
+    - CheckoutErrorResponse: If there is an error during the checkout process.
+    """
+    request = CheckoutRequest(
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        delivery_address=delivery_address,
+        items=items
+        
+    )
+
+    try:
+       async with httpx.AsyncClient() as client:
+            response = await client.post(N8N_CHECKOUT_WEBHOOK_URL, json=request.model_dump(), timeout=30.0)
+            data = response.json()
+            if data.get("success") is False:
+                return CheckoutErrorResponse(**data)
+            return CheckoutResponse(**data)
+    
+    except httpx.TimeoutException:
+        return CheckoutErrorResponse(
+            success=False,
+            error_code=CheckoutErrorCode.PAYMENT_PROVIDER_DOWN,
+            reason="The payment provider is currently down. Please try again later."
+        )
+    except httpx.RequestError as e:
+        return CheckoutErrorResponse(
+            success=False,
+            error_code=CheckoutErrorCode.UNKNOWN_ERROR,
+            reason=f"An error occurred while creating the checkout session: {str(e)}"
+        )
+       
 
 
 @tool
@@ -93,7 +150,7 @@ async def fetch_inventory(query:str="") -> list[Product]:
         fields = record['fields']
         product = Product(
             name=fields.get('name', ''),
-            product_id=fields.get('product_id', ''),
+            product_id=record.get('id', ''),
             stock_quantity=int(fields.get('stock_quantity', 0)),
             price=float(fields.get('price', 0.0)),
             description=fields.get('description', '')
@@ -102,55 +159,3 @@ async def fetch_inventory(query:str="") -> list[Product]:
 
     return matched_products
 
-@tool
-async def record_order(customer_name: str, customer_phone: str, product_id: str, quantity: int) -> str:
-    """
-        Create a customer order.
-
-        Call this tool ONLY after the customer has confirmed the purchase.
-
-        Requirements before calling:
-        - A valid product has been identified.
-        - The requested quantity is known.
-        - The requested quantity is available.
-        - The customer's full name is known.
-        - The customer's phone number is known.
-
-        Never call this tool if any required information is missing.
-        Never invent or guess any argument.
-
-        Behavior:
-        - Verifies that the product exists.
-        - Verifies that enough stock is available.
-        - Decreases the stock.
-        - Creates the order with status "pending".
-        - Returns either a success message or an error message.
-
-        Do not retry automatically if this tool returns an error.
-
-    """
-    
-    new_order = {
-        "customer_phone": customer_phone,
-        "product_id": product_id,
-        "quantity": quantity,
-        "customer_name": customer_name,
-        "status": "pending",
-    }
-
-    product = await asyncio.to_thread(stocks_table.first, formula=f"{{product_id}}='{product_id}'")
-    if not product:
-        return f"Product with ID {product_id} not found in inventory."
-
-    else:
-        available_quantity = int(product['fields'].get('stock_quantity', 0))
-
-        if quantity > available_quantity:
-            return f"Insufficient stock for product {product_id}. Available: {available_quantity}, Requested: {quantity}."
-
-        new_quantity = available_quantity - quantity
-        await asyncio.to_thread(stocks_table.update, product['id'], {"stock_quantity": new_quantity})
-
-    record = await asyncio.to_thread(orders_table.create, new_order)
-    record_id = record["fields"]["order_id"]
-    return f"Order {record_id} recorded successfully for {customer_name} (Status: pending)."

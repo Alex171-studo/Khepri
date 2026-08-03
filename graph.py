@@ -1,5 +1,5 @@
 from langchain.agents import create_agent
-from tools import fetch_inventory, record_order
+from tools import fetch_inventory, create_checkout_session
 from langchain_openai import ChatOpenAI
 from langgraph.graph.message import MessagesState
 from langchain.messages import ToolMessage
@@ -16,18 +16,12 @@ async def log_tool_calls(request, handler):
         return await handler(request)
     except Exception as e:
         print(f"  [middleware] error calling {call['name']}: {e}")
-        
-        return ToolMessage(
-            content=f"Error calling tool {call['name']}: {str(e)}",
-            tool_call_id=call['id'],
-            name=call['name'],
-            status="error"
-        )
+        return f"Erreur lors de l'exécution de l'outil {call['name']}: {str(e)}"
 
 def get_executive_agent(checkpointer):
 
     return create_agent(
-        tools=[fetch_inventory, record_order],
+        tools=[fetch_inventory, create_checkout_session],
         system_prompt=system_prompt,
         model=model,
         middleware=[log_tool_calls],
