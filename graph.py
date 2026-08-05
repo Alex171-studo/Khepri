@@ -6,7 +6,7 @@ from langchain.messages import ToolMessage
 from langchain.agents.middleware import wrap_tool_call
 from agent_executor_prompt import system_prompt
 
-model = ChatOpenAI(model_name="gpt-5.4-mini", temperature=0.0)
+model = ChatOpenAI(model_name="gpt-5.4-mini", temperature=0.3)
 
 @wrap_tool_call
 async def log_tool_calls(request, handler):

@@ -4,11 +4,12 @@ from dotenv import load_dotenv
 from graph import get_executive_agent
 from contextlib import asynccontextmanager
 import os
-from langchain.messages import HumanMessage, SystemMessage
-from agent_executor_prompt import prompt
-
+from langchain_core.messages import HumanMessage
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from tools import http_client
+import asyncio
+from sync import start_sync_loop
 
 load_dotenv(override=True)
 
@@ -20,11 +21,16 @@ class ChatMessageResponse(BaseModel):
     status:str = Field(default="success", description="Status of the message processing")
     response:str = Field(description="The generated response message")
 
+
+SYNC_SECRET=os.environ.get("SYNC_SECRET")
+
 executive_agent = None
+sync_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global executive_agent
+    global sync_task
     db_uri = os.environ.get("DB_URL")
 
     async with AsyncConnectionPool(
@@ -43,8 +49,21 @@ async def lifespan(app: FastAPI):
 
         executive_agent = get_executive_agent(checkpointer)
         print("✅ Executive agent initialized and ready to handle requests.")
+
+        sync_task = asyncio.create_task(start_sync_loop())
+        print("✅ Airtable sync service started.")
+
         yield
 
+    if sync_task:
+        sync_task.cancel()
+
+        try:
+            await sync_task
+        except asyncio.CancelledError:
+            pass
+    
+    await http_client.aclose()
     print("🛑 Superbase connection closed.")
 
 app = FastAPI(
@@ -58,9 +77,9 @@ async def respond_user_request(request:ChatMessageRequest) -> ChatMessageRespons
     customer_phone = request.customer_phone
     message = request.message
     config = {"configurable":{"thread_id":customer_phone}}
-    input_messages = prompt.format_messages(customer_phone=customer_phone, message=message)
 
-    result = await executive_agent.ainvoke({"messages":input_messages}, config=config)  
+    result = await executive_agent.ainvoke({"messages": [HumanMessage(content=message)]}, config=config)  
     response = result["messages"][-1].content
 
     return ChatMessageResponse(response=response)
+

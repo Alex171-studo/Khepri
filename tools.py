@@ -1,34 +1,28 @@
 from langchain.tools import tool
 from dotenv import load_dotenv
-import os
-from pyairtable import Api
 from pydantic import BaseModel, Field
-from qdrant_client import QdrantClient
-from langchain_openai import OpenAIEmbeddings
+from qdrant_client.models import Filter, FieldCondition, Range
 import asyncio
 from schemas.checkout import CheckoutRequest, CheckoutResponse, CheckoutErrorResponse, CheckoutErrorCode, purchase_item
 import httpx
 from typing import Union
-
-load_dotenv(override=True)
-
-N8N_CHECKOUT_WEBHOOK_URL = os.getenv("N8N_CHECKOUT_WEBHOOK_URL")
-
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-
-COLLECTION_NAME = "khepri_products"
-MODEL_NAME = "text-embedding-3-small"
-
-embeddings = OpenAIEmbeddings(model=MODEL_NAME)
-qdrant_client = QdrantClient(
-    url=os.environ.get("QDRANT_URL"),
-    api_key=os.environ.get("QDRANT_API_KEY"),
-    cloud_inference=True
+from langchain_core.runnables import RunnableConfig
+from async_lru import alru_cache
+from qdrant_client.models import MatchValue
+from config import (
+    N8N_CHECKOUT_WEBHOOK_URL, 
+    COLLECTION_NAME, 
+    MODEL_NAME, 
+    embeddings, 
+    airtable_api, 
+    table, 
+    qdrant_client
 )
 
-airtable = Api(AIRTABLE_API_KEY)
-stocks_table = airtable.table(AIRTABLE_BASE_ID, "Stocks")
+load_dotenv(override=True)
+http_client = httpx.AsyncClient(timeout=30.0)
+
+PAGE_SIZE = 10
 
 class Product(BaseModel):
     name: str = Field(description="Name of the product")
@@ -37,12 +31,22 @@ class Product(BaseModel):
     price: float = Field(description="Price of the product")
     description: str = Field(description="Description of the product")
 
+class ProductList(BaseModel):
+    products: list[Product] = Field(description="List of products matching the query")
+    total_matching: int = Field(description="Total number of products matching the query")
+    has_more: bool = Field(description="Indicates if there are more products available beyond the returned list")
+
+@alru_cache(ttl=300)
+async def _get_cached_catalog() -> list[Product]:
+    records = await asyncio.to_thread(table.all)
+    return [r for r in records if r["fields"].get("active",True)]
+
 @tool
 async def create_checkout_session(
     customer_name: str,
-    customer_phone: str,
     delivery_address: str,
-    items: list[purchase_item]
+    items: list[purchase_item],
+    config: RunnableConfig
     
 ) -> Union[CheckoutResponse, CheckoutErrorResponse]:
     """
@@ -52,7 +56,6 @@ async def create_checkout_session(
 
     Arguments:
     - customer_name: The full name of the customer.
-    - customer_phone: The phone number of the customer.
     - delivery_address: The delivery address for the order.
     - items: A list of items being purchased, each containing the product_id and quantity (eg. [{"product_id": "prod_123", "quantity": 2}, {"product_id": "prod_456", "quantity": 1}]).
 
@@ -60,6 +63,8 @@ async def create_checkout_session(
     - CheckoutResponse: If the checkout session is created successfully.
     - CheckoutErrorResponse: If there is an error during the checkout process.
     """
+    config = config.get("configurable", {}) if config else {}
+    customer_phone = config.get("thread_id", "")
     request = CheckoutRequest(
         customer_name=customer_name,
         customer_phone=customer_phone,
@@ -69,12 +74,11 @@ async def create_checkout_session(
     )
 
     try:
-       async with httpx.AsyncClient() as client:
-            response = await client.post(N8N_CHECKOUT_WEBHOOK_URL, json=request.model_dump(), timeout=30.0)
-            data = response.json()
-            if data.get("success") is False:
-                return CheckoutErrorResponse(**data)
-            return CheckoutResponse(**data)
+        response = await http_client.post(N8N_CHECKOUT_WEBHOOK_URL, json=request.model_dump(), timeout=30.0)
+        data = response.json()
+        if data.get("success") is False:
+            return CheckoutErrorResponse(**data)
+        return CheckoutResponse(**data)
     
     except httpx.TimeoutException:
         return CheckoutErrorResponse(
@@ -92,7 +96,7 @@ async def create_checkout_session(
 
 
 @tool
-async def fetch_inventory(query:str="") -> list[Product]:
+async def fetch_inventory(query:str="", offset: int = 0) -> ProductList:
     """
     Search the product catalog.
 
@@ -107,9 +111,10 @@ async def fetch_inventory(query:str="") -> list[Product]:
     - query:
         - If the user mentions a product or describes one, pass that text.
         - If the user asks to see all available products (e.g. "Quels produits avez-vous ?", "Montrez-moi votre catalogue"), pass an empty string "".
+    - offset: The number of products already returned in previous responses. 0 for the first research. If the client ask for more products, increment this value by 10.
 
     Returns:
-    Up to three matching products (or the first products in the catalog when query is empty), including their internal product_id, name, description, price and available stock.
+    A list of products matching the query, along with metadata about the search results.
 
     Never invent product information. Always rely on this tool.
     """
@@ -120,42 +125,69 @@ async def fetch_inventory(query:str="") -> list[Product]:
     if query:
         query = query.lower().strip()
 
-        embedded_query = embeddings.embed_query(query)
-        results = qdrant_client.query_points(
+        embedded_query = await embeddings.aembed_query(query)
+
+        results = await asyncio.to_thread(
+            qdrant_client.query_points,
             collection_name=COLLECTION_NAME,
             query=embedded_query,
-            limit=3
+            limit=3,
+            query_filter=Filter(
+                must=[
+                    FieldCondition(key="active", match=MatchValue(value=True)),
+                    FieldCondition(key="stock_quantity",range=Range(gte=1))
+                    ]
+            )
         )
 
         if not results.points:
-            return []
+            return ProductList(
+                products=[],
+                total_matching=0,
+                has_more=False
+            )
 
         points = results.points
 
         for point in points:
-            airtable_record_id = point.payload.get("airtable_id")
+            payload = point.payload if point.payload else {}
+            product = Product(
+                name=payload.get("name", ""),
+                product_id=payload.get("product_id", ""),
+                stock_quantity=int(payload.get("stock_quantity", 0)),
+                price=float(payload.get("price", 0.0)),
+                description=payload.get("description", "")
+            )
+            matched_products.append(product)
 
-            if not airtable_record_id:
-                continue
-
-            record = await asyncio.to_thread(stocks_table.get, airtable_record_id)
-            if not record:
-                continue
-            records.append(record)
+        return ProductList(
+            products=matched_products,
+            total_matching=len(matched_products),
+            has_more=False
+        )
 
     else:
-        records = await asyncio.to_thread(stocks_table.all, max_records=10)
+        all_records = await _get_cached_catalog()
+        in_stock_records = [record for record in all_records if int(record.get("fields", {}).get("stock_quantity", 0)) > 0]
+        total_matching = len(in_stock_records)
+        page_records = in_stock_records[offset:offset + PAGE_SIZE]
+
+        for record in page_records:
+            product = Product(
+                name=record.get("fields", {}).get("name", ""),
+                product_id=record.get("id", ""),
+                stock_quantity=int(record.get("fields", {}).get("stock_quantity", 0)),
+                price=float(record.get("fields", {}).get("price", 0.0)),
+                description=record.get("fields", {}).get("description", "")
+            )
+            matched_products.append(product)
+
+    return ProductList(
+        products=matched_products,
+        total_matching=total_matching,
+        has_more=(offset + PAGE_SIZE) < total_matching
+    )
+
+
+
     
-    for record in records:
-        fields = record['fields']
-        product = Product(
-            name=fields.get('name', ''),
-            product_id=record.get('id', ''),
-            stock_quantity=int(fields.get('stock_quantity', 0)),
-            price=float(fields.get('price', 0.0)),
-            description=fields.get('description', '')
-        )
-        matched_products.append(product)
-
-    return matched_products
-
