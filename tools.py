@@ -74,9 +74,20 @@ async def create_checkout_session(
     )
 
     try:
-        response = await http_client.post(N8N_CHECKOUT_WEBHOOK_URL, json=request.model_dump(), timeout=30.0)
+        response = await http_client.post(
+            N8N_CHECKOUT_WEBHOOK_URL, 
+            json=request.model_dump(), 
+            timeout=30.0)
+
+        if not response.is_success:
+            return CheckoutErrorResponse(
+                success=False,
+                error_code=CheckoutErrorCode.PAYMENT_PROVIDER_DOWN,
+                reason=f"The payment provider respond with the code {response.status_code}."
+            )
+
         data = response.json()
-        if data.get("success") is False:
+        if not data.get("success", True) :
             return CheckoutErrorResponse(**data)
         return CheckoutResponse(**data)
     
@@ -168,7 +179,13 @@ async def fetch_inventory(query:str="", offset: int = 0) -> ProductList:
 
     else:
         all_records = await _get_cached_catalog()
-        in_stock_records = [record for record in all_records if int(record.get("fields", {}).get("stock_quantity", 0)) > 0]
+
+        in_stock_records = [
+            record for record in all_records 
+            if int(record.get("fields", {}).get("stock_quantity", 0)) > 0 
+            and record.get("fields").get("active")
+        ]
+
         total_matching = len(in_stock_records)
         page_records = in_stock_records[offset:offset + PAGE_SIZE]
 
