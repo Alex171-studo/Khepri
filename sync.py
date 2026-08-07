@@ -65,6 +65,8 @@ async def sync_products():
         return
 
     print(f"🔄 {len(records)} products changed.")
+    for record in records:
+        print(record.get("fields").get("name"))
     await asyncio.to_thread(upsert_products, records)
     _get_cached_catalog.cache_clear()
 
