@@ -56,14 +56,21 @@ async def sync_products():
 
     dt_last = parse_iso(last_timestamp)
     safe_timestamp = dt_last - timedelta(seconds=2)
-
     formatted_time = safe_timestamp.strftime('%Y-%m-%d %H:%M:%S')
     formula = f"IS_AFTER({{last_modified_time}}, '{formatted_time}')"
-    records = await asyncio.to_thread(table.all, formula=formula)
+
+    raw_records = await asyncio.to_thread(table.all, formula=formula)
+
+    if not raw_records:
+        return
+
+    records = [r for r in raw_records
+            if get_record_timestamp(r) and parse_iso(get_record_timestamp(r) > dt_last)
+        ]
 
     if not records:
         return
-
+    
     print(f"🔄 {len(records)} products changed.")
     for record in records:
         print(record.get("fields").get("name"))
@@ -72,8 +79,7 @@ async def sync_products():
 
     latest = get_latest_timestamp(records)
     if latest:
-        if parse_iso(latest) > dt_last:
-            save_timestamp(latest)
+        save_timestamp(latest)
 
     print("✅ Synchronization complete.")
 
