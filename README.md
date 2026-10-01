@@ -1,4 +1,4 @@
-# Khepri — Assistant IA de Vente & Automatisation E-commerce
+# Khepri : Assistant IA de Vente & Automatisation E-commerce
 
 **Démo en ligne :** [https://khepri-store.vercel.app/](https://khepri-store.vercel.app/)
 
@@ -63,4 +63,3 @@ Le système repose sur un pipeline distribué associant orchestration de workflo
 | **Base de données**       | PostgreSQL (Supabase)                              | Persistance de la mémoire conversationnelle (`thread_id`)       |
 | **Déploiement Front**     | Vercel                      | Interface utilisateur web responsive                            |
 | **Canaux d'entrée**       | Web Interface, WhatsApp API, Telegram API | Multi-canaux                                           |
-```
