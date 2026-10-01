@@ -1,4 +1,4 @@
-# Khepri : Assistant IA de Vente & Automatisation E-commerce
+# Khepri: Assistant IA de Vente & Automatisation E-commerce
 
 **Démo en ligne :** [https://khepri-store.vercel.app/](https://khepri-store.vercel.app/)
 
